@@ -1,0 +1,210 @@
+/*QEP & Torque Motor Measurements
+ *March 14, 2019
+*/
+
+#include "msp.h"
+#include "adc.h"
+#include "LCD.h"
+#include <stdint.h>
+
+#define PORT_BITA BIT5  //Sensor A (P3.5)
+#define PORT_BITB BIT3  //Sensor B (P2.3)
+#define PERIOD 32768    //1 second using micro-controller A clock
+#define SPEED_SCALE 15  //Number of senses (gaps on wheel) per full turn
+
+//Variables used in speed measurement
+volatile int Speed;             //Displayed Speed
+volatile float Time_Count;      //Time roll over count
+volatile float Time_1 = 0.0;    //First time value
+volatile float Time_2 = 0.0;    //Second time value
+volatile float Time_Difference; //Change in Time
+volatile float Time;            //Time between pulses
+volatile int Time_State = 0;    //Holds time capture state
+
+//Direction indicator
+int Direction;
+
+int mode = 0;	//Determines displayed measurement
+int off;	//motor on or off
+
+void TA0_N_IRQHandler(void) //roll over interrupt for Speed
+{
+    TIMER_A0->CTL &= ~TIMER_A_CTL_IFG;//Clears the interrupt flag
+
+    Time_Count ++;//keeps track of roll overs
+
+    TIMER_A0->CTL &= ~TIMER_A_CTL_IFG;//Ensures flag clear
+}//end TimerA N Interrupt
+
+void PORT3_IRQHandler(void) //Sensor A pulse detection
+{
+    P3->IFG &= ~PORT_BITA;//Interrupt Flag Clear
+
+    //Speed
+    if(Time_State == 1)//If Time 1 has been
+    {
+        Time_2 = TIMER_A0->R;//Takes second time measurement
+        Time_State = 0;
+
+        Time_Difference = (Time_Count * PERIOD + Time_2) - Time_1;
+        Time = (Time_Difference) / PERIOD;	//Period = period of timer; Time = period of waveform -> 1/Time = frequency
+        Speed = (60/(Time)) / SPEED_SCALE;	//Frequency * 60 to convert to RPM (SPEED_SCALE defined above. -Number of 
+											//pulses per revolution(# of gaps))
+    }
+    else
+    {
+        Time_1 = TIMER_A0->R;
+        Time_Count = 0;
+        Time_State ++;
+    }//end else
+
+    //Direction
+    if(P2->IN & PORT_BITB)	//Determines the direction (Sensor B High or Low)
+            Direction = 1;
+        else
+            Direction = 0;
+
+    P3->IFG &= ~PORT_BITA; //Flag Clear
+}//end Port3 Interrupt
+
+void PORT1_IRQHandler(void) //Pushbutton used to change display
+{
+    P1->IFG &= ~BIT1;
+    mode += 1; //rotates displayed screen
+
+    if(mode == 3)
+        mode = 0; //loops back to first screen
+}
+
+int main(void){
+    WDT_A->CTL = WDT_A_CTL_PW | WDT_A_CTL_HOLD;     // stop watchdog timer
+    P4DIR = 0xFF; //LCD Data Outputs
+    adcInit(15); //CH 15 pin 6.0 (4.2 (CH 11) available)
+
+    INIT_LCD();
+    CLEAR_LCD();
+
+    TIMER_A0->CTL = TIMER_A_CTL_SSEL__ACLK | TIMER_A_CTL_MC__UP | TIMER_A_CTL_IE | TIMER_A_CTL_ID__1;//Timer A initialization for speed measurements
+    TIMER_A0->CCR[0] = PERIOD - 1;//Timer A max count
+
+    int ADC_Value; //Temporary ADC Value
+    int Torque; //After ADC scale conversion
+    float T_Scale = 0.8; //Torque scale (Assumed linear amplifier relationship)
+
+    //Torque Values
+    int T_tens;//displayed placeholder
+    int T_ones;
+    int T_decimal;
+
+    //Speed Values
+    int S_thousands;//displayed placeholder
+    int S_hundreds;
+    int S_tens;
+    int S_ones;
+
+    //Push Button Initialization
+    P1->DIR &= ~BIT1;   //PB-1
+    P1->IES |= BIT1;    //Edge Select (falling)
+    P1->IE |= BIT1;     //Interrupt enable
+    P1->OUT |= BIT1;
+    P1->REN |= BIT1;
+
+    //Speed sensor A pin configuration
+    P3->SEL0 &= ~PORT_BITA;
+    P3->SEL1 &= ~PORT_BITA;
+    P3->DIR &= ~PORT_BITA;//Set port as input with pull up resistor
+    P3->REN = PORT_BITA;
+    P3->IES |= PORT_BITA;// Enable interrupt on falling edge
+    P3->IE |= PORT_BITA;
+
+    //Sensor B pin configuration
+    P2->SEL0 &= ~PORT_BITB;
+    P2->SEL1 &= ~PORT_BITB;
+    P2->DIR &= ~PORT_BITB;
+    P2->REN = PORT_BITB;
+
+    NVIC_EnableIRQ(PORT3_IRQn);//Speed/Direction sensor A
+    NVIC_EnableIRQ(TA0_N_IRQn);//Speed timer
+    NVIC_EnableIRQ(PORT1_IRQn);//Pushbutton
+    __enable_interrupts();
+    mode = 0;
+
+while(1)
+    {
+        S_thousands = (Speed/1000)%10;//Split the value to be displayed
+        S_hundreds = (Speed/100)%10;
+        S_tens = (Speed/10)%10;
+        S_ones = Speed%10;
+
+        if (mode == 0) //mode 0 = Speed
+        {
+            OUTPUT_STR("    Speed:  ");
+            OUTPUT_STR("                                "); //spaces for next line
+
+            OUTPUT_CHAR(S_thousands+48);  //thousands place +48 for char ascii table
+            OUTPUT_CHAR(S_hundreds+48);   //hundreds place +48 for char ascii table
+            OUTPUT_CHAR(S_tens+48);       //tens place +48 for char ascii table
+            OUTPUT_CHAR(S_ones+48);       //ones place +48 for char ascii table
+            OUTPUT_STR(" RPM       ");
+            P4OUT = ((0x02 & 0xF0));    // HIGHER NIBBLE "0000" 0010
+            LCD_ENABLE();               // NEGATIVE EDGE TRIGGER
+            P4OUT =((0x02 & 0x0F) << 4);// LOWER NIBBLE   0000 "0010"
+            LCD_ENABLE();               // NEGATIVE EDGE TRIGGER
+            _delay_ms(DELAY2);          // WAIT FOR LCD TO EXECUTE COMMAND ;APPROX 1.6mS
+        }//end mode 0
+
+        if(off) //If motor is running ((off = 1) = On)
+        {
+            ADC_Value = adcSample();//Torque ADC (8 Bit ADC 0-255 for 25 lb-ft) 
+            Torque = ((ADC_Value / T_Scale) - 1);//Torque ADC scale (if ideal adc input voltage range is used. There should be no need for a torque scale or offset)
+        }
+
+
+        T_tens = (Torque/100)%10;//Split the value to be displayed
+        T_ones = (Torque/10)%10;
+        T_decimal = Torque%10;
+
+        if (mode == 1) //mode 1 = torque
+        {
+            OUTPUT_STR("    Torque:");
+            OUTPUT_STR("                                 "); //spaces for next line
+            OUTPUT_CHAR(T_tens+48);        //hundreds place +48 for char ascii table
+            OUTPUT_CHAR(T_ones+48);        //tens place +48 for char ascii table
+            OUTPUT_CHAR(46);             //decimal point
+            OUTPUT_CHAR(T_decimal+48);     //ones place +48 for char ascii table
+            OUTPUT_STR(" lb-ft");
+            P4OUT = ((0x02 & 0xF0));    // HIGHER NIBBLE "0000" 0010
+            LCD_ENABLE();               // NEGATIVE EDGE TRIGGER
+            P4OUT =((0x02 & 0x0F) << 4);// LOWER NIBBLE   0000 "0010"
+            LCD_ENABLE();               // NEGATIVE EDGE TRIGGER
+            _delay_ms(DELAY2);          // WAIT FOR LCD TO EXECUTE COMMAND ;APPROX 1.6mS
+        }//end mode 1
+
+        if (mode == 2) //mode 2 = Direction
+        {
+            OUTPUT_STR("   Direction:");
+            OUTPUT_STR("                             "); //spaces for next line
+
+            if(Direction == 1)
+                OUTPUT_STR("Positive Seq.   ");
+            else
+                OUTPUT_STR("Negative Seq.   ");
+
+            P4OUT = ((0x02 & 0xF0));    // HIGHER NIBBLE "0000" 0010
+            LCD_ENABLE();               // NEGATIVE EDGE TRIGGER
+            P4OUT =((0x02 & 0x0F) << 4);// LOWER NIBBLE   0000 "0010"
+            LCD_ENABLE();               // NEGATIVE EDGE TRIGGER
+            _delay_ms(DELAY2);          // WAIT FOR LCD TO EXECUTE COMMAND ;APPROX 1.6mS
+
+        }//end mode 2
+
+        if(Time_Count > 3) //Detects if motor is running (Time_Count is reset upon speed sensor pulse detection)
+        {
+            Speed = 0;
+            Torque = 0;
+            off = 0; //motor is off (not rotating)
+        }
+        else
+            off = 1;//motor is on 
+    }//End while loop
+}//End main
